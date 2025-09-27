@@ -8,7 +8,7 @@ from torch.nn import SyncBatchNorm
 from torch.optim import Optimizer, Adam
 from torch.utils.data import Dataset, DataLoader
 
-from byol_pytorch.byol_pytorch import BYOL
+from BYOL import BYOL
 
 from beartype import beartype
 from beartype.typing import Optional
