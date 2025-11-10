@@ -21,16 +21,16 @@ class MultiHeadAttention(nn.Module):
 
         self.linear_out = nn.Linear(dim_v, dim_in)  # 最后的线性变换
     
-    def forward(self, x, mask=None):
-        bs, seq_len, dim_in = x.shape
+    def forward(self, q, k, v, mask=None):
+        bs, seq_len, dim_in = q.shape
         num_h = self.num_heads
         # 计算单头的 d_k 和 d_v
         d_k = self.dim_k // num_h
         d_v = self.dim_v // num_h
 
-        q = self.linear_q(x).reshape(bs, seq_len, num_h, d_k).transpose(1, 2)  # (bs, num_heads, seq_len, d_k)
-        k = self.linear_k(x).reshape(bs, seq_len, num_h, d_k).transpose(1, 2)  # (bs, num_heads, seq_len, d_k)
-        v = self.linear_v(x).reshape(bs, seq_len, num_h, d_v).transpose(1, 2)  # (bs, num_heads, seq_len, d_v)
+        q = self.linear_q(q).reshape(bs, seq_len, num_h, d_k).transpose(1, 2)  # (bs, num_heads, seq_len, d_k)
+        k = self.linear_k(k).reshape(bs, seq_len, num_h, d_k).transpose(1, 2)  # (bs, num_heads, seq_len, d_k)
+        v = self.linear_v(v).reshape(bs, seq_len, num_h, d_v).transpose(1, 2)  # (bs, num_heads, seq_len, d_v)
 
         attn_score = torch.matmul(q, k.transpose(2, 3)) * self._norm_factor  # (bs, num_heads, seq_len, seq_len)
 
@@ -45,6 +45,101 @@ class MultiHeadAttention(nn.Module):
         output = self.linear_out(output)  # (bs, seq_len, dim_in)
         return output, attn_weight
         
+class MultiQueryAttention(nn.Module):
+    def __init__(self, dim_in, dim_k, dim_v, num_heads=8):
+        super().__init__()
+        assert dim_k % num_heads == 0 and dim_v % num_heads == 0, "dim_k and dim_v must be divisible by num_heads"
+        self.dim_in = dim_in
+        self.dim_k = dim_k
+        self.dim_v = dim_v
+        self.num_heads = num_heads
+
+        d_k = dim_k // num_heads
+        d_v = dim_v // num_heads
+
+        # Q 仍然按多头映射；K/V 只映射出单头维度（共享给所有 Q 头）
+        self.linear_q = nn.Linear(dim_in, dim_k)
+        self.linear_k = nn.Linear(dim_in, d_k) # 1个kv头
+        self.linear_v = nn.Linear(dim_in, d_v)
+
+        self._norm_factor = 1.0 / d_k ** 0.5
+
+        self.linear_out = nn.Linear(d_v, dim_in)
+
+    def forward(self, q, k, v, mask=None):
+        bs, seq_len, _ = q.shape
+        h = self.num_heads
+        d_k = self.dim_k // h
+        d_v = self.dim_v // h
+
+        q = self.linear_q(q).reshape(bs, seq_len, h, d_k).transpose(1, 2)  # (bs, num_heads, seq_len, d_k)
+        k = self.linear_k(k).reshape(bs, seq_len, 1, d_k).transpose(1, 2)  # (bs, num_heads, seq_len, d_k)
+        v = self.linear_v(v).reshape(bs, seq_len, 1, d_v).transpose(1, 2)  # (bs, num_heads, seq_len, d_v)
+
+        # 将单个 KV 头广播到 h 个 Q 头
+        k = k.expand(bs, h, seq_len, d_k)
+        v = v.expand(bs, h, seq_len, d_v)
+
+        attn_score = torch.matmul(q, k.transpose(2, 3)) * self._norm_factor  # (bs, num_heads, seq_len, seq_len)
+
+        if mask is not None:
+            mask = mask.unsqueeze(1).unsqueeze(2)  # (bs, 1, 1, seq_len)
+            attn_score = attn_score.masked_fill(mask == 0, float('-inf'))
+
+        attn_weight = F.softmax(attn_score, dim=-1)  # (bs, num_heads, seq_len, seq_len)
+
+        output = torch.matmul(attn_weight, v)  # (bs, num_heads, seq_len, d_v)
+        output = output.transpose(1, 2).contiguous().reshape(bs, seq_len, self.dim_v)  # (bs, seq_len, dim_v)
+        output = self.linear_out(output)  # (bs, seq_len, dim_in)
+        return output, attn_weight
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, dim_in, dim_k, dim_v, num_heads=8, kv_heads=2):
+        super().__init__()
+        assert dim_k % num_heads == 0 and dim_v % num_heads == 0
+        assert num_heads % kv_heads == 0, "num_heads 必须能被 kv_heads 整除"
+        self.dim_in, self.dim_k, self.dim_v = dim_in, dim_k, dim_v
+        self.num_heads = num_heads
+        self.kv_heads = kv_heads
+
+        d_k = dim_k // num_heads
+        d_v = dim_v // num_heads
+
+        # Q: 仍按 num_heads 输出；K/V: 仅输出 kv_heads 个头
+        self.linear_q = nn.Linear(dim_in, dim_k)
+        self.linear_k = nn.Linear(dim_in, d_k * kv_heads)
+        self.linear_v = nn.Linear(dim_in, d_v * kv_heads)
+
+        self.scale = d_k ** -0.5
+        self.linear_out = nn.Linear(dim_v, dim_in)
+
+    def forward(self, q, k, v, mask=None):
+        bs, T, _ = q.shape
+        h, kh = self.num_heads, self.kv_heads
+        d_k = self.dim_k // h
+        d_v = self.dim_v // h
+        group = h // kh  # 每个 KV 头服务的 Q 头数
+
+        # Q: (bs,h,T,d_k)
+        q = self.linear_q(q).reshape(bs, T, h, d_k).transpose(1, 2)
+
+        # K: (bs,kh,T,d_k)  -> 重复到 (bs,h,T,d_k)
+        k = self.linear_k(k).reshape(bs, T, kh, d_k).transpose(1, 2)
+        k = k.repeat_interleave(group, dim=1)
+
+        # V: (bs,kh,T,d_v)  -> 重复到 (bs,h,T,d_v)
+        v = self.linear_v(v).reshape(bs, T, kh, d_v).transpose(1, 2)
+        v = v.repeat_interleave(group, dim=1)
+
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (bs,h,T,T)
+        if mask is not None:
+            attn_score = attn_score.masked_fill(mask.unsqueeze(1).unsqueeze(2) == 0, float('-inf'))
+        attn_weight = F.softmax(attn_score, dim=-1)
+
+        out = torch.matmul(attn_weight, v)                       # (bs,h,T,d_v)
+        out = out.transpose(1, 2).contiguous().reshape(bs, T, self.dim_v)  # (bs,T,dim_v)
+        out = self.linear_out(out)                               # (bs,T,dim_in)
+        return out, attn_weight
 
 class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.): # qkv_bias 设为True更常见
