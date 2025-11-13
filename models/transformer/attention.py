@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -131,14 +132,14 @@ class GroupedQueryAttention(nn.Module):
         v = self.linear_v(v).reshape(bs, T, kh, d_v).transpose(1, 2)
         v = v.repeat_interleave(group, dim=1)
 
-        attn_score = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (bs,h,T,T)
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) * self.scale # (bs,h,T,T)
         if mask is not None:
             attn_score = attn_score.masked_fill(mask.unsqueeze(1).unsqueeze(2) == 0, float('-inf'))
         attn_weight = F.softmax(attn_score, dim=-1)
 
-        out = torch.matmul(attn_weight, v)                       # (bs,h,T,d_v)
+        out = torch.matmul(attn_weight, v) # (bs,h,T,d_v)
         out = out.transpose(1, 2).contiguous().reshape(bs, T, self.dim_v)  # (bs,T,dim_v)
-        out = self.linear_out(out)                               # (bs,T,dim_in)
+        out = self.linear_out(out) # (bs,T,dim_in)
         return out, attn_weight
 
 class TransformerBlock(nn.Module):
@@ -167,4 +168,51 @@ class TransformerBlock(nn.Module):
         x = self.norm2(x)
         x = self.mlp(x)
         x = x + residual
+        return x
+
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, dim, max_len=5000):
+        super().__init__()
+        # pe: (max_len, dim)
+        pe = torch.zeros(max_len, dim)  # (L, D)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # (L, 1)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2, dtype=torch.float) * (-math.log(10000.0) / dim)
+        )  # (D/2,)
+
+        pe[:, 0::2] = torch.sin(position * div_term)  # 偶数维
+        pe[:, 1::2] = torch.cos(position * div_term)  # 奇数维
+
+        # 变成 (1, L, D)，方便和 (B, L, D) 相加
+        pe = pe.unsqueeze(0)  # (1, max_len, dim)
+
+        # register_buffer 表示这是模型的一部分，但不是参数（不参与反向更新）
+        self.register_buffer('pe', pe)  # pe: (1, max_len, dim)
+
+    def forward(self, x):
+        """
+        x: (B, L, D)
+        返回: x + 位置编码
+        """
+        B, L, D = x.size()
+        # 只取前 L 个位置，并广播到 batch 维度
+        x = x + self.pe[:, :L, :]
+        return x
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, dim, depth, num_heads, mlp_ratio=4., qkv_bias=True,
+                 drop=0., attn_drop=0., max_len=5000):
+        super().__init__()
+        self.pos_encoding = SinusoidalPositionalEncoding(dim, max_len)
+        self.layers = nn.ModuleList([
+            TransformerBlock(dim, num_heads, mlp_ratio, qkv_bias, drop, attn_drop)
+            for _ in range(depth)
+        ])
+
+    def forward(self, x):
+        # x: (B, L, D)
+        x = self.pos_encoding(x)  # 就在这里加位置编码，一次就够
+
+        for blk in self.layers:
+            x = blk(x)
         return x
