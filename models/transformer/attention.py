@@ -65,7 +65,7 @@ class MultiQueryAttention(nn.Module):
 
         self._norm_factor = 1.0 / d_k ** 0.5
 
-        self.linear_out = nn.Linear(d_v, dim_in)
+        self.linear_out = nn.Linear(dim_v, dim_in)
 
     def forward(self, q, k, v, mask=None):
         bs, seq_len, _ = q.shape
